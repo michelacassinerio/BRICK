@@ -56,8 +56,8 @@ const R = 10;                    // ball radius
 const SPEED = 15.25;             // units per tick (60 ticks/s), measured from video
 const SUB = 4;                   // collision sub-steps per tick
 const INTERVAL = 4;              // ticks between balls (≈61 units apart, as on iPad)
-const MIN_ANG = 6 * Math.PI / 180;
-const MIN_VY = SPEED * Math.sin(MIN_ANG);
+const MIN_ANG = 18 * Math.PI / 180;  // flattest launch the real game allows (measured on iPad: ~18°)
+const MIN_VY = SPEED * Math.sin(6 * Math.PI / 180); // after bounces a ball never goes flatter than this
 
 // ---------- Deterministic volley physics (shared by game and solver) ----------
 class Volley {
@@ -149,13 +149,21 @@ function mulberry32(a) {
 // ---------- Solver ----------
 // One volley from a given state. "dead" = a brick is left in the row just above
 // the danger line, so the next shift puts it on the line (game over).
+// Pressure left on the board after a shot: remaining hit points, weighted by how close each
+// row is to the danger line, divided by the balls available next turn (≈ turns of work left).
+const DANGER_W = [0.05, 0.15, 0.4, 1.0, 3.0, 3.0];
+function boardDanger(g, n) {
+  let s = 0;
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (g[r][c] > 0) s += g[r][c] * DANGER_W[r];
+  return s / (n + 1);
+}
 function evalAngle(grid, x0, n, ang) {
   const g = grid.map(r => r.slice());
   const v = new Volley(g, x0, n, ang, null);
   let guard = 0;
   while (!v.done && guard++ < 9000) v.tick();
   const dead = g[ROWS - 2].some(x => x > 0) ? 1 : 0;
-  return { a: ang, d: v.destroyed, w: v.wdamage, dead, g, x: v.firstX ?? x0 };
+  return { a: ang, d: v.destroyed, w: v.wdamage, dead, danger: boardDanger(g, n), g, x: v.firstX ?? x0 };
 }
 // Path of the first ball (bounce points), used to draw the suggested shot.
 function ballPath(grid, x0, ang, maxBounces = 6) {
@@ -172,22 +180,23 @@ function angleList(stepDeg) {
   return out;
 }
 const pause = () => new Promise(r => setTimeout(r, 0));
-
 const LOOK = { candidates: 12, samples: 3, step2: 1 };   // 2nd-turn search settings
+
+// Strategy weights, all in "bricks": how many bricks of points a risk is worth.
+const RISK = {
+  prudente:   { deadNb: 60, notRobust2: 40, notSurv2: 90, danger1: 4,   danger2: 3,   safe2: 15, next: 0.3 },
+  bilanciata: { deadNb: 25, notRobust2: 15, notSurv2: 60, danger1: 1.5, danger2: 1,   safe2: 6,  next: 0.3 },
+  punti:      { deadNb: 8,  notRobust2: 4,  notSurv2: 30, danger1: 0.3, danger2: 0.2, safe2: 2,  next: 0.3 },
+};
 
 // A job is a slice of work that can run inline or inside a Web Worker.
 //  t1: evaluate a list of first-shot angles
 //  t2: for one candidate state + one sampled new row, evaluate a list of second-shot angles
 function runJob(m) {
-  if (m.type === 't1') return m.angs.map(a => evalAngle(m.grid, m.x, m.n, a));
+  if (m.type === 't1') return m.angs.map(a => { const r = evalAngle(m.grid, m.x, m.n, a); return r; });
   const rnd = mulberry32(1000 * (m.turnNo + 1) + m.s * 7919);
   const g2 = m.g.map(r => r.slice()); g2.pop(); g2.unshift(newRow(m.turnNo + 1, rnd));
-  let bestD = -1, safe = 0;
-  for (const a2 of m.angs) {
-    const r2 = evalAngle(g2, m.x, m.n, a2);
-    if (!r2.dead) { safe++; if (r2.d > bestD) bestD = r2.d; }
-  }
-  return { safe, bestD };
+  return m.angs.map(a2 => { const r2 = evalAngle(g2, m.x, m.n, a2); return [r2.dead, r2.d, r2.danger]; });
 }
 async function runInline(jobs, prog) {
   const out = []; let t0 = performance.now();
@@ -199,24 +208,27 @@ async function runInline(jobs, prog) {
 }
 function chunks(arr, k) { const o = []; for (let i = 0; i < arr.length; i += k) o.push(arr.slice(i, i + k)); return o; }
 
-// Returns the best first shot, looking two turns ahead:
-//   1) never die after this turn
-//   2) keep at least one safe shot for the next turn (over a few random new rows)
-//   3) avoid angles whose neighbours (±1°) are deadly — aim is never perfect
-//   4) prefer states where many next-turn shots are safe
-//   5) points: this turn first (smoothed over ±1°), next turn with a lower weight
-async function solve(grid, x0, n, turnNo, onProgress = () => {}, runJobs = runInline) {
+// Best first shot, looking two turns ahead. Everything is expressed in "bricks":
+//   + bricks destroyed now (averaged over ±1°, aim is never perfect)
+//   + a fraction of the best safe score next turn
+//   − risk penalties: deadly angles within ±2°, no robust safe shot next turn (one that
+//     stays safe within ±1°), no safe shot at all next turn, pressure left in the low rows.
+// Shots that lose immediately are never chosen if any alternative exists.
+async function solve(grid, x0, n, turnNo, onProgress = () => {}, runJobs = runInline, risk = 'prudente') {
+  const K = RISK[risk] || RISK.prudente;
   // --- turn 1: every angle, 0.5° step
   const jobs1 = chunks(angleList(0.5), 12).map(angs => ({ type: 't1', grid, x: x0, n, angs }));
   const res = (await runJobs(jobs1, p => onProgress(0.15 * p))).flat();
   for (let k = 0; k < res.length; k++) {
-    let s = 0, dd = 0, m = 0;
-    for (let j = k - 2; j <= k + 2; j++) if (res[j]) { s += res[j].d; dd += res[j].dead; m++; }
-    res[k].avgD = s / m; res[k].nDead = dd / m;
-    res[k].key1 = -res[k].dead * 1e7 - res[k].nDead * 1e5 + res[k].avgD * 1000 + res[k].d * 10 + res[k].w * 0.01;
+    let s = 0, m = 0, dd = 0, md = 0;
+    for (let j = k - 2; j <= k + 2; j++) if (res[j]) { s += res[j].d; m++; }
+    for (let j = k - 4; j <= k + 4; j++) if (res[j]) { dd += res[j].dead; md++; }
+    const r = res[k];
+    r.avgD = s / m; r.nDead = dd / md;
+    r.key1 = -r.dead * 1e6 + r.avgD - K.deadNb * r.nDead - K.danger1 * r.danger + r.w * 1e-4;
   }
   const ranked = res.slice().sort((a, b) => b.key1 - a.key1);
-  if (ranked[0].dead) return { a: ranked[0].a, d: ranked[0].d, d2: 0, dead: 1, surv2: 0 };
+  if (ranked[0].dead) return { a: ranked[0].a, d: ranked[0].d, d2: 0, dead: 1, surv2: 0, risk: 'alto' };
 
   // --- diverse safe candidates (≥1.5° apart)
   const cand = [];
@@ -226,32 +238,47 @@ async function solve(grid, x0, n, turnNo, onProgress = () => {}, runJobs = runIn
     if (cand.length >= LOOK.candidates) break;
   }
 
-  // --- turn 2
-  const angParts = chunks(angleList(LOOK.step2), 43);
+  // --- turn 2: per candidate and sampled new row, every angle at 1°
+  const angs2 = angleList(LOOK.step2), parts = chunks(angs2, 43);
   const jobs2 = [], owner = [];
   cand.forEach((c, ci) => {
-    c.safe = new Array(LOOK.samples).fill(0); c.best = new Array(LOOK.samples).fill(0);
-    for (let s = 0; s < LOOK.samples; s++) for (const angs of angParts) {
-      jobs2.push({ type: 't2', g: c.g, x: c.x, n: n + 1, turnNo, s, angs }); owner.push([ci, s]);
-    }
+    c.t2 = Array.from({ length: LOOK.samples }, () => new Array(angs2.length));
+    for (let s = 0; s < LOOK.samples; s++) parts.forEach((angs, pi) => {
+      jobs2.push({ type: 't2', g: c.g, x: c.x, n: n + 1, turnNo, s, angs }); owner.push([ci, s, pi * 43]);
+    });
   });
   const out2 = await runJobs(jobs2, p => onProgress(0.15 + 0.85 * p));
-  out2.forEach((o, i) => {
-    const [ci, s] = owner[i], c = cand[ci];
-    c.safe[s] += o.safe; c.best[s] = Math.max(c.best[s], o.bestD);
-  });
+  out2.forEach((o, i) => { const [ci, s, off] = owner[i]; o.forEach((v, j) => { cand[ci].t2[s][off + j] = v; }); });
   for (const c of cand) {
-    const nA = angParts.flat().length;
-    c.surv2 = c.safe.filter(v => v > 0).length / LOOK.samples;          // next turn still has a safe shot
-    c.safe2 = c.safe.reduce((a, b) => a + b, 0) / (LOOK.samples * nA);  // how many next-turn shots are safe
-    c.d2 = c.best.reduce((a, b) => a + b, 0) / LOOK.samples;
-    c.key = c.surv2 * 1e6 - c.nDead * 5e5 + c.safe2 * 2000
-          + c.avgD * 1000 + c.d2 * 300 + c.d * 10 + c.w * 0.01;
+    let surv = 0, robust = 0, safeFrac = 0, v2sum = 0, d2sum = 0;
+    for (const arr of c.t2) {
+      let best = null, bestRobust = null, nSafe = 0;
+      for (let j = 0; j < arr.length; j++) {
+        const [dead, d, danger] = arr[j];
+        if (dead) continue;
+        nSafe++;
+        const val = d - K.danger2 * danger;
+        if (best === null || val > best.val) best = { val, d };
+        const nbSafe = (!arr[j - 1] || !arr[j - 1][0]) && (!arr[j + 1] || !arr[j + 1][0]);
+        if (nbSafe && (bestRobust === null || val > bestRobust.val)) bestRobust = { val, d };
+      }
+      if (best) surv++;
+      if (bestRobust) robust++;
+      safeFrac += nSafe / arr.length;
+      const pick = bestRobust || best;
+      if (pick) { v2sum += pick.val; d2sum += pick.d; }
+    }
+    const S = LOOK.samples;
+    c.surv2 = surv / S; c.robust2 = robust / S; c.safe2 = safeFrac / S; c.d2 = d2sum / S;
+    c.key = c.avgD + K.next * (v2sum / S)
+          - K.deadNb * c.nDead - K.notRobust2 * (1 - c.robust2) - K.notSurv2 * (1 - c.surv2)
+          - K.danger1 * c.danger + K.safe2 * c.safe2 + c.d * 1e-3;
   }
   onProgress(1);
   cand.sort((a, b) => b.key - a.key);
   const b = cand[0];
-  return { a: b.a, d: b.d, d2: b.d2, dead: 0, surv2: b.surv2 };
+  const level = b.surv2 < 1 ? 'alto' : (b.robust2 < 1 || b.nDead > 0 || b.danger > 1.5) ? 'medio' : 'basso';
+  return { a: b.a, d: b.d, d2: b.d2, dead: 0, surv2: b.surv2, robust2: b.robust2, danger: b.danger, risk: level };
 }
 
 // Inside a Web Worker this same script answers jobs.
