@@ -123,7 +123,7 @@
   </div>
 </section>
 
-<div class="ver">Versione 7 nov – v5 · tiro max 18° · strategie · niente tiri corti al muro</div>
+<div class="ver">Versione 7 nov – v7 · si perde alla riga 7 · tiro max 17,7° · strategie · niente tiri corti · confronto tiri laterali</div>
 
 <!-- ===================== LIVE AIM VIEW ===================== -->
 <section id="vLive" class="view">
@@ -147,7 +147,7 @@
 const W = 460, H = 800;
 const TOP = 150;                 // centre of the white line under the score = ceiling
 const CEIL = TOP + 2.2;
-const COLS = 6, ROWS = 6;        // row 5 touches the danger line -> game over
+const COLS = 6, ROWS = 7;        // rows 0..5 are playable (row 5 sits on the danger line); a brick reaching row 6 = game over
 const GX = 27.65, PX = 69.1, BW = 60;
 const GY = TOP + 14.8, PY = 72.9, BH = 55;
 const LINE_X0 = 16, LINE_X1 = 444; // white line extent
@@ -158,7 +158,7 @@ const R = 10;                    // ball radius
 const SPEED = 15.25;             // units per tick (60 ticks/s), measured from video
 const SUB = 4;                   // collision sub-steps per tick
 const INTERVAL = 4;              // ticks between balls (≈61 units apart, as on iPad)
-const MIN_ANG = 18 * Math.PI / 180;  // flattest launch the real game allows (measured on iPad: ~18°)
+const MIN_ANG = 17.7 * Math.PI / 180;  // flattest launch the real game allows (measured: 17.6–17.8° in video, ~18° on iPad)
 const MIN_VY = SPEED * Math.sin(6 * Math.PI / 180); // after bounces a ball never goes flatter than this
 
 // ---------- Deterministic volley physics (shared by game and solver) ----------
@@ -253,7 +253,7 @@ function mulberry32(a) {
 // the danger line, so the next shift puts it on the line (game over).
 // Pressure left on the board after a shot: remaining hit points, weighted by how close each
 // row is to the danger line, divided by the balls available next turn (≈ turns of work left).
-const DANGER_W = [0.05, 0.15, 0.4, 1.0, 3.0, 3.0];
+const DANGER_W = [0.03, 0.08, 0.2, 0.45, 1.0, 3.0, 3.0];
 function boardDanger(g, n) {
   let s = 0;
   for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (g[r][c] > 0) s += g[r][c] * DANGER_W[r];
@@ -1061,10 +1061,17 @@ async function solveNow() {
   const atLimit = Math.abs(best.a - MIN_ANG) < 0.6 * Math.PI / 180 ? 'destra' : Math.abs(best.a - (Math.PI - MIN_ANG)) < 0.6 * Math.PI / 180 ? 'sinistra' : null;
   const tLabel = atLimit ? `Inclina al massimo verso ${atLimit} — ${t.charAt(0).toLowerCase() + t.slice(1)}` : t;
   const unk = current.unknown.flat().some(x => x) && current.grid.flat().some(v => v < 0);
-  if (best.dead) setAim('warn', 'Nessun tiro sicuro 😬', 'Il meno peggio: ' + t + ' (' + deg + '°)');
+  // the two "all to one side" shots at maximum tilt, for comparison with the real game
+  const side = a => {
+    if (firstSegment(lx, a) < MIN_SEG) return 'troppo vicino al muro';
+    const r = evalAngle(g, lx, n, a);
+    return '+' + r.d + (r.dead ? ' ☠️' : '');
+  };
+  const extra = `Al massimo a destra: ${side(MIN_ANG)} · a sinistra: ${side(Math.PI - MIN_ANG)}`;
+  if (best.dead) setAim('warn', 'Nessun tiro sicuro 😬', 'Il meno peggio: ' + t + ' (' + deg + '°)', extra);
   else setAim(unk ? 'warn' : '', '🎯 ' + tLabel,
     `+${best.d} mattoncini ora` + (best.surv2 < 1 ? ' · ⚠ turno dopo a rischio' : ` · ~${Math.round(best.d2)} al turno dopo`) +
-    ` · angolo ${deg}° · rischio ${best.risk}` + (unk ? ' · ⚠ correggi le caselle rosse' : ''));
+    ` · angolo ${deg}° · rischio ${best.risk}` + (unk ? ' · ⚠ correggi le caselle rosse' : ''), extra);
 }
 function describeTarget(path, g) {
   const p = path[1]; if (!p) return 'Lancio verso l’alto';
@@ -1077,14 +1084,15 @@ function describeTarget(path, g) {
   if (p.type === 'top') return `Mira alla linea bianca, sopra la colonna ${col(p.x)}`;
   const wall = p.type === 'left' ? 'muro sinistro' : 'muro destro';
   const rr = row(p.y);
-  if (rr >= 1 && rr <= ROWS) return `Mira al ${wall}, all’altezza della riga ${rr}`;
+  if (rr >= 1 && rr <= ROWS - 1) return `Mira al ${wall}, all’altezza della riga ${rr}`;
   const pct = Math.round(100 * (FLOOR_Y - p.y) / (FLOOR_Y - TOP));
   return `Mira al ${wall}, a ${pct}% dell’altezza (sotto i mattoncini)`;
 }
-function setAim(kind, big, small) {
+function setAim(kind, big, small, extra) {
   const b = $('aimBox'); b.className = 'aim' + (kind ? ' ' + kind : '');
-  b.innerHTML = `<div class="big"></div><div class="small"></div>`;
+  b.innerHTML = `<div class="big"></div><div class="small"></div><div class="small extra" style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(12,39,104,.25)"></div>`;
   b.querySelector('.big').textContent = big; b.querySelector('.small').textContent = small;
+  const e = b.querySelector('.extra'); if (extra) e.textContent = extra; else e.remove();
 }
 
 // ---------- drawing ----------
