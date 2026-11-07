@@ -51,6 +51,10 @@
   #liveFeedback.ok { background: #1f9d55; }
   #liveFeedback.near { background: #d99a00; }
   #liveFeedback .sub { display: block; font-size: 12px; font-weight: 700; opacity: .9; margin-top: 2px; }
+  .seg { display: flex; gap: 6px; margin: 10px 14px 0; background: var(--soft); padding: 5px; border-radius: 14px; }
+  .seg button { flex: 1; border: 0; border-radius: 10px; padding: 10px 4px; font: 800 14px Montserrat, system-ui, sans-serif; background: transparent; color: #fff; cursor: pointer; }
+  .seg button.on { background: #fff; color: var(--navy); }
+  .ver { text-align: center; font-size: 11px; opacity: .55; margin: 18px 0 6px; }
   .err { margin: 10px 14px; padding: 12px 14px; border-radius: 14px; background: #7a2b3f; font-size: 14px; font-weight: 700; display: none; }
 </style>
 </head>
@@ -92,6 +96,11 @@
 <!-- ===================== RESULT VIEW ===================== -->
 <section id="vRes" class="view">
   <div id="resWrap"><canvas id="resCanvas"></canvas></div>
+  <div class="seg" id="riskSeg">
+    <button data-r="prudente">🛡️ Prudente</button>
+    <button data-r="bilanciata">⚖️ Bilanciata</button>
+    <button data-r="punti">💥 Punti</button>
+  </div>
   <div class="aim wait" id="aimBox"><div class="big">Analisi…</div></div>
   <div class="bar">
     <button class="btn" id="btnLive">🎥 Mira dal vivo</button>
@@ -113,6 +122,8 @@
     <div class="note" style="margin:8px 0 0">Puoi anche toccare la foto nel punto del lanciatore per spostarlo.</div>
   </div>
 </section>
+
+<div class="ver">Versione 7 nov – v4 · tiro max 18° · strategie</div>
 
 <!-- ===================== LIVE AIM VIEW ===================== -->
 <section id="vLive" class="view">
@@ -981,6 +992,16 @@ $('resCanvas').addEventListener('click', e => {
   if (u[1] > FLOOR_Y - 90) { current.lx = Math.max(R, Math.min(W - R, u[0])); $('lxEd').value = current.lx; drawResult(); solveNow(); }
 });
 
+// ---------- strategy ----------
+let riskMode = 'prudente';
+try { riskMode = localStorage.getItem('brick_risk') || 'prudente'; } catch (e) {}
+function paintRisk() { document.querySelectorAll('#riskSeg button').forEach(b => b.classList.toggle('on', b.dataset.r === riskMode)); }
+document.querySelectorAll('#riskSeg button').forEach(b => b.onclick = () => {
+  riskMode = b.dataset.r; paintRisk(); try { localStorage.setItem('brick_risk', riskMode); } catch (e) {}
+  solveNow();
+});
+paintRisk();
+
 // ---------- solver (worker pool) ----------
 let pool;
 function getPool() {
@@ -1019,8 +1040,8 @@ async function solveNow() {
   setAim('wait', 'Calcolo il lancio migliore…', '0%');
   const prog = p => { if (token === solveToken) setAim('wait', 'Calcolo il lancio migliore…', Math.round(p * 100) + '%'); };
   let best;
-  try { best = await solve(g, lx, n, n, prog, getPool() ? runPool : runInline); }
-  catch (e) { pool = null; best = await solve(g, lx, n, n, prog, runInline); }
+  try { best = await solve(g, lx, n, n, prog, getPool() ? runPool : runInline, riskMode); }
+  catch (e) { pool = null; best = await solve(g, lx, n, n, prog, runInline, riskMode); }
   if (token !== solveToken) return;
   current.best = best; $('btnLive').disabled = false;
   current.path = ballPath(g, lx, best.a, 5);
@@ -1033,7 +1054,7 @@ async function solveNow() {
   if (best.dead) setAim('warn', 'Nessun tiro sicuro 😬', 'Il meno peggio: ' + t + ' (' + deg + '°)');
   else setAim(unk ? 'warn' : '', '🎯 ' + tLabel,
     `+${best.d} mattoncini ora` + (best.surv2 < 1 ? ' · ⚠ turno dopo a rischio' : ` · ~${Math.round(best.d2)} al turno dopo`) +
-    ` · angolo ${deg}°` + (unk ? ' · ⚠ correggi le caselle rosse' : ''));
+    ` · angolo ${deg}° · rischio ${best.risk}` + (unk ? ' · ⚠ correggi le caselle rosse' : ''));
 }
 function describeTarget(path, g) {
   const p = path[1]; if (!p) return 'Lancio verso l’alto';
