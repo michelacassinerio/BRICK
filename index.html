@@ -123,7 +123,7 @@
   </div>
 </section>
 
-<div class="ver">Versione 7 nov – v4 · tiro max 18° · strategie</div>
+<div class="ver">Versione 7 nov – v5 · tiro max 18° · strategie · niente tiri corti al muro</div>
 
 <!-- ===================== LIVE AIM VIEW ===================== -->
 <section id="vLive" class="view">
@@ -282,6 +282,14 @@ function angleList(stepDeg) {
   return out;
 }
 const pause = () => new Promise(r => setTimeout(r, 0));
+// Length of the first straight stretch (launcher -> side wall). If it is very short the player
+// cannot control the angle, so such shots are never suggested.
+const MIN_SEG = 4 * R;            // 2 ball diameters
+function firstSegment(lx, a) {
+  const c = Math.cos(a);
+  if (Math.abs(c) < 1e-9) return Infinity;
+  return c > 0 ? (W - R - lx) / c : (lx - R) / -c;
+}
 const LOOK = { candidates: 12, samples: 3, step2: 1 };   // 2nd-turn search settings
 
 // Strategy weights, all in "bricks": how many bricks of points a risk is worth.
@@ -327,15 +335,16 @@ async function solve(grid, x0, n, turnNo, onProgress = () => {}, runJobs = runIn
     for (let j = k - 4; j <= k + 4; j++) if (res[j]) { dd += res[j].dead; md++; }
     const r = res[k];
     r.avgD = s / m; r.nDead = dd / md;
-    r.key1 = -r.dead * 1e6 + r.avgD - K.deadNb * r.nDead - K.danger1 * r.danger + r.w * 1e-4;
+    r.short = firstSegment(x0, r.a) < MIN_SEG ? 1 : 0;
+    r.key1 = -r.dead * 1e6 - r.short * 1e5 + r.avgD - K.deadNb * r.nDead - K.danger1 * r.danger + r.w * 1e-4;
   }
   const ranked = res.slice().sort((a, b) => b.key1 - a.key1);
-  if (ranked[0].dead) return { a: ranked[0].a, d: ranked[0].d, d2: 0, dead: 1, surv2: 0, risk: 'alto' };
+  if (ranked[0].dead || ranked[0].short) return { a: ranked[0].a, d: ranked[0].d, d2: 0, dead: 1, surv2: 0, risk: 'alto' };
 
   // --- diverse safe candidates (≥1.5° apart)
   const cand = [];
   for (const r of ranked) {
-    if (r.dead) break;
+    if (r.dead || r.short) break;
     if (cand.every(c => Math.abs(c.a - r.a) > 1.5 * Math.PI / 180)) cand.push(r);
     if (cand.length >= LOOK.candidates) break;
   }
@@ -355,13 +364,14 @@ async function solve(grid, x0, n, turnNo, onProgress = () => {}, runJobs = runIn
     let surv = 0, robust = 0, safeFrac = 0, v2sum = 0, d2sum = 0;
     for (const arr of c.t2) {
       let best = null, bestRobust = null, nSafe = 0;
+      const usable = j => arr[j] && !arr[j][0] && firstSegment(c.x, angs2[j]) >= MIN_SEG;
       for (let j = 0; j < arr.length; j++) {
-        const [dead, d, danger] = arr[j];
-        if (dead) continue;
+        const [, d, danger] = arr[j];
+        if (!usable(j)) continue;
         nSafe++;
         const val = d - K.danger2 * danger;
         if (best === null || val > best.val) best = { val, d };
-        const nbSafe = (!arr[j - 1] || !arr[j - 1][0]) && (!arr[j + 1] || !arr[j + 1][0]);
+        const nbSafe = (j === 0 || usable(j - 1)) && (j === arr.length - 1 || usable(j + 1));
         if (nbSafe && (bestRobust === null || val > bestRobust.val)) bestRobust = { val, d };
       }
       if (best) surv++;
