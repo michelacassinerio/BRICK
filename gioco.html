@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Brick – gioco</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@700;800;900&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;height:100%;background:#0c2768;overflow:hidden;touch-action:none;
+    -webkit-user-select:none;user-select:none;font-family:Montserrat,Arial,sans-serif}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  #stage{position:relative}
+  canvas{display:block;touch-action:none}
+  #hint{position:absolute;top:12px;left:12px;border:0;border-radius:999px;padding:6px 11px;
+    background:rgba(255,255,255,.12);color:#fff;font:700 12px Montserrat,Arial,sans-serif;cursor:pointer}
+  #hint:disabled{opacity:.5}
+  #coachLink{position:absolute;top:12px;right:12px;border-radius:999px;padding:6px 11px;background:rgba(255,255,255,.12);color:#fff;font:700 12px Montserrat,Arial,sans-serif;text-decoration:none}
+  #over{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+    background:rgba(5,18,52,.72)}
+  #over .box{background:#fff;color:#0c2768;border-radius:22px;padding:26px 34px;text-align:center;min-width:220px}
+  #over h2{margin:0 0 6px;font-size:22px;font-weight:900}
+  #over .big{font-size:56px;font-weight:900;line-height:1.1}
+  #over .rec{font-size:14px;font-weight:700;opacity:.7;margin-bottom:18px}
+  #over button{border:0;border-radius:999px;background:#0c2768;color:#fff;
+    font:800 16px Montserrat,Arial,sans-serif;padding:12px 28px;cursor:pointer}
+</style>
+</head>
+<body>
+<div id="wrap"><div id="stage">
+  <canvas id="c"></canvas>
+  <button id="hint" title="Calcola l'angolo migliore">💡 Suggerisci</button>
+  <a id="coachLink" href="index.html">📷 Coach</a>
+  <div id="over"><div class="box">
+    <h2>Partita finita</h2>
+    <div class="big" id="ovScore">0</div>
+    <div class="rec" id="ovRec">Record 0</div>
+    <button id="again">Gioca ancora</button>
+  </div></div>
+</div></div>
+
+<script id="engine">
+// ---------- Geometry (logical units; measured on a real iPad screenshot) ----------
+// 1 unit = field width / 460. The two thin side lines are the walls.
+const W = 460, H = 800;
+const TOP = 150;                 // centre of the white line under the score = ceiling
+const CEIL = TOP + 2.2;
+const COLS = 6, ROWS = 6;        // row 5 touches the danger line -> game over
+const GX = 27.65, PX = 69.1, BW = 60;
+const GY = TOP + 14.8, PY = 72.9, BH = 55;
+const LINE_X0 = 16, LINE_X1 = 444; // white line extent
+const DANGER_Y = GY + 5 * PY + BH;
+const FLOOR_Y = TOP + 592.8;     // centre of launcher / landed balls
+const LAUNCH_R = 18.8;           // radius of the white launcher disk
+const R = 10;                    // ball radius
+const SPEED = 15.25;             // units per tick (60 ticks/s), measured from video
+const SUB = 4;                   // collision sub-steps per tick
+const INTERVAL = 4;              // ticks between balls (≈61 units apart, as on iPad)
+const MIN_ANG = 6 * Math.PI / 180;
+const MIN_VY = SPEED * Math.sin(MIN_ANG);
+
+// ---------- Deterministic volley physics (shared by game and solver) ----------
+class Volley {
+  constructor(grid, x0, n, ang, cb) {
+    this.g = grid; this.x0 = x0; this.n = n; this.cb = cb;
+    this.vx = Math.cos(ang) * SPEED; this.vy = -Math.sin(ang) * SPEED;
+    this.balls = []; this.launched = 0; this.t = 0; this.landed = 0;
+    this.firstX = null; this.destroyed = 0; this.damage = 0; this.wdamage = 0;
+  }
+  get done() { return this.landed >= this.n; }
+  tick() {
+    if (this.launched < this.n && this.t % INTERVAL === 0) {
+      this.balls.push({ x: this.x0, y: FLOOR_Y, vx: this.vx, vy: this.vy, on: true, sx: 0 });
+      this.launched++;
+    }
+    for (const b of this.balls) {
+      if (!b.on) continue;
+      for (let k = 0; k < SUB; k++) if (!this.step(b)) break;
+    }
+    this.t++;
+  }
+  step(b) {
+    const f = 1 / SUB;
+    b.x += b.vx * f; b.y += b.vy * f;
+    if (b.x < R) { b.x = R; b.vx = Math.abs(b.vx); if (this.trace) this.trace.push({ x: b.x, y: b.y, type: 'left' }); }
+    else if (b.x > W - R) { b.x = W - R; b.vx = -Math.abs(b.vx); if (this.trace) this.trace.push({ x: b.x, y: b.y, type: 'right' }); }
+    if (b.y < CEIL + R) { b.y = CEIL + R; b.vy = Math.abs(b.vy); if (this.trace) this.trace.push({ x: b.x, y: b.y, type: 'top' }); }
+    if (b.vy > 0 && b.y >= FLOOR_Y) {
+      b.y = FLOOR_Y; b.on = false; b.sx = b.x; this.landed++;
+      if (this.trace) this.trace.push({ x: b.x, y: b.y, type: 'floor' });
+      if (this.firstX === null) this.firstX = Math.min(W - 24, Math.max(24, b.x));
+      return false;
+    }
+    let c0 = Math.floor((b.x - R - GX) / PX), c1 = Math.floor((b.x + R - GX) / PX);
+    let r0 = Math.floor((b.y - R - GY) / PY), r1 = Math.floor((b.y + R - GY) / PY);
+    if (r1 < 0 || r0 >= ROWS) return true;
+    c0 = Math.max(0, c0); c1 = Math.min(COLS - 1, c1);
+    r0 = Math.max(0, r0); r1 = Math.min(ROWS - 1, r1);
+    for (let r = r0; r <= r1; r++) {
+      const row = this.g[r];
+      for (let c = c0; c <= c1; c++) {
+        if (row[c] <= 0) continue;
+        const bx = GX + c * PX, by = GY + r * PY;
+        const px = b.x < bx ? bx : (b.x > bx + BW ? bx + BW : b.x);
+        const py = b.y < by ? by : (b.y > by + BH ? by + BH : b.y);
+        let dx = b.x - px, dy = b.y - py;
+        const d2 = dx * dx + dy * dy;
+        if (d2 >= R * R) continue;
+        let nx, ny;
+        if (d2 === 0) { const s = Math.hypot(b.vx, b.vy); nx = -b.vx / s; ny = -b.vy / s; }
+        else { const d = Math.sqrt(d2); nx = dx / d; ny = dy / d; }
+        const dot = b.vx * nx + b.vy * ny;
+        b.x = px + nx * R; b.y = py + ny * R;
+        if (dot < 0) {
+          b.vx -= 2 * dot * nx; b.vy -= 2 * dot * ny;
+          if (Math.abs(b.vy) < MIN_VY) {               // never let a ball go flat
+            b.vy = (b.vy < 0 ? -1 : 1) * MIN_VY;
+            b.vx = (b.vx < 0 ? -1 : 1) * Math.sqrt(SPEED * SPEED - MIN_VY * MIN_VY);
+          } else {
+            const s = SPEED / Math.hypot(b.vx, b.vy); b.vx *= s; b.vy *= s;
+          }
+          if (this.trace) this.trace.push({ x: b.x, y: b.y, type: 'brick', r, c, v: row[c] });
+          row[c]--; this.damage++; this.wdamage += 1 + r;
+          const killed = row[c] === 0;
+          if (killed) this.destroyed++;
+          if (this.cb) this.cb(r, c, killed);
+        }
+      }
+    }
+    return true;
+  }
+}
+
+// ---------- Random rows (rng injectable so the solver can use seeded samples) ----------
+function newRow(t, rnd = Math.random) {
+  const row = new Array(COLS).fill(0);
+  const counts = [1, 2, 3, 3, 4, 4, 4, 5, 5];
+  const k = counts[Math.floor(rnd() * counts.length)];
+  const cols = [0, 1, 2, 3, 4, 5];
+  for (let i = cols.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [cols[i], cols[j]] = [cols[j], cols[i]]; }
+  for (const c of cols.slice(0, k)) row[c] = t + Math.floor(rnd() * (Math.floor(t * 0.8) + 1));
+  return row;
+}
+function mulberry32(a) {
+  return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+
+// ---------- Solver ----------
+// One volley from a given state. "dead" = a brick is left in the row just above
+// the danger line, so the next shift puts it on the line (game over).
+function evalAngle(grid, x0, n, ang) {
+  const g = grid.map(r => r.slice());
+  const v = new Volley(g, x0, n, ang, null);
+  let guard = 0;
+  while (!v.done && guard++ < 9000) v.tick();
+  const dead = g[ROWS - 2].some(x => x > 0) ? 1 : 0;
+  return { a: ang, d: v.destroyed, w: v.wdamage, dead, g, x: v.firstX ?? x0 };
+}
+// Path of the first ball (bounce points), used to draw the suggested shot.
+function ballPath(grid, x0, ang, maxBounces = 6) {
+  const g = grid.map(r => r.slice());
+  const v = new Volley(g, x0, 1, ang, null);
+  v.trace = [{ x: x0, y: FLOOR_Y, type: 'start' }];
+  let guard = 0;
+  while (!v.done && v.trace.length <= maxBounces && guard++ < 4000) v.tick();
+  return v.trace.slice(0, maxBounces + 1);
+}
+function angleList(stepDeg) {
+  const out = [], st = stepDeg * Math.PI / 180;
+  for (let a = MIN_ANG; a <= Math.PI - MIN_ANG + 1e-9; a += st) out.push(a);
+  return out;
+}
+const pause = () => new Promise(r => setTimeout(r, 0));
+
+const LOOK = { candidates: 12, samples: 3, step2: 1 };   // 2nd-turn search settings
+
+// A job is a slice of work that can run inline or inside a Web Worker.
+//  t1: evaluate a list of first-shot angles
+//  t2: for one candidate state + one sampled new row, evaluate a list of second-shot angles
+function runJob(m) {
+  if (m.type === 't1') return m.angs.map(a => evalAngle(m.grid, m.x, m.n, a));
+  const rnd = mulberry32(1000 * (m.turnNo + 1) + m.s * 7919);
+  const g2 = m.g.map(r => r.slice()); g2.pop(); g2.unshift(newRow(m.turnNo + 1, rnd));
+  let bestD = -1, safe = 0;
+  for (const a2 of m.angs) {
+    const r2 = evalAngle(g2, m.x, m.n, a2);
+    if (!r2.dead) { safe++; if (r2.d > bestD) bestD = r2.d; }
+  }
+  return { safe, bestD };
+}
+async function runInline(jobs, prog) {
+  const out = []; let t0 = performance.now();
+  for (let i = 0; i < jobs.length; i++) {
+    out.push(runJob(jobs[i])); prog((i + 1) / jobs.length);
+    if (performance.now() - t0 > 30) { await pause(); t0 = performance.now(); }
+  }
+  return out;
+}
+function chunks(arr, k) { const o = []; for (let i = 0; i < arr.length; i += k) o.push(arr.slice(i, i + k)); return o; }
+
+// Returns the best first shot, looking two turns ahead:
+//   1) never die after this turn
+//   2) keep at least one safe shot for the next turn (over a few random new rows)
+//   3) avoid angles whose neighbours (±1°) are deadly — aim is never perfect
+//   4) prefer states where many next-turn shots are safe
+//   5) points: this turn first (smoothed over ±1°), next turn with a lower weight
+async function solve(grid, x0, n, turnNo, onProgress = () => {}, runJobs = runInline) {
+  // --- turn 1: every angle, 0.5° step
+  const jobs1 = chunks(angleList(0.5), 12).map(angs => ({ type: 't1', grid, x: x0, n, angs }));
+  const res = (await runJobs(jobs1, p => onProgress(0.15 * p))).flat();
+  for (let k = 0; k < res.length; k++) {
+    let s = 0, dd = 0, m = 0;
+    for (let j = k - 2; j <= k + 2; j++) if (res[j]) { s += res[j].d; dd += res[j].dead; m++; }
+    res[k].avgD = s / m; res[k].nDead = dd / m;
+    res[k].key1 = -res[k].dead * 1e7 - res[k].nDead * 1e5 + res[k].avgD * 1000 + res[k].d * 10 + res[k].w * 0.01;
+  }
+  const ranked = res.slice().sort((a, b) => b.key1 - a.key1);
+  if (ranked[0].dead) return { a: ranked[0].a, d: ranked[0].d, d2: 0, dead: 1, surv2: 0 };
+
+  // --- diverse safe candidates (≥1.5° apart)
+  const cand = [];
+  for (const r of ranked) {
+    if (r.dead) break;
+    if (cand.every(c => Math.abs(c.a - r.a) > 1.5 * Math.PI / 180)) cand.push(r);
+    if (cand.length >= LOOK.candidates) break;
+  }
+
+  // --- turn 2
+  const angParts = chunks(angleList(LOOK.step2), 43);
+  const jobs2 = [], owner = [];
+  cand.forEach((c, ci) => {
+    c.safe = new Array(LOOK.samples).fill(0); c.best = new Array(LOOK.samples).fill(0);
+    for (let s = 0; s < LOOK.samples; s++) for (const angs of angParts) {
+      jobs2.push({ type: 't2', g: c.g, x: c.x, n: n + 1, turnNo, s, angs }); owner.push([ci, s]);
+    }
+  });
+  const out2 = await runJobs(jobs2, p => onProgress(0.15 + 0.85 * p));
+  out2.forEach((o, i) => {
+    const [ci, s] = owner[i], c = cand[ci];
+    c.safe[s] += o.safe; c.best[s] = Math.max(c.best[s], o.bestD);
+  });
+  for (const c of cand) {
+    const nA = angParts.flat().length;
+    c.surv2 = c.safe.filter(v => v > 0).length / LOOK.samples;          // next turn still has a safe shot
+    c.safe2 = c.safe.reduce((a, b) => a + b, 0) / (LOOK.samples * nA);  // how many next-turn shots are safe
+    c.d2 = c.best.reduce((a, b) => a + b, 0) / LOOK.samples;
+    c.key = c.surv2 * 1e6 - c.nDead * 5e5 + c.safe2 * 2000
+          + c.avgD * 1000 + c.d2 * 300 + c.d * 10 + c.w * 0.01;
+  }
+  onProgress(1);
+  cand.sort((a, b) => b.key - a.key);
+  const b = cand[0];
+  return { a: b.a, d: b.d, d2: b.d2, dead: 0, surv2: b.surv2 };
+}
+
+// Inside a Web Worker this same script answers jobs.
+if (typeof importScripts === 'function') self.onmessage = e => self.postMessage(runJob(e.data));
+
+</script>
+<script>
+// ---------- Game state ----------
+const MX = 14;                   // side margin so the wall lines are visible
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const hintBtn = document.getElementById('hint');
+const over = document.getElementById('over');
+let grid, turn, score, best = 0, launcherX, state, volley, aim, flyTime, acc;
+let shiftT = 1, flashes = {}, parts = [], hint = null, solving = false, lastTs = 0;
+try { best = +localStorage.getItem('brick_best') || 0; } catch (e) {}
+
+function reset() {
+  grid = Array.from({ length: ROWS }, () => new Array(COLS).fill(0));
+  turn = 1; score = 0; launcherX = W / 2; state = 'aim'; volley = null; aim = null;
+  grid[0] = newRow(1); shiftT = 1; parts = []; flashes = {}; hint = null;
+  over.style.display = 'none';
+}
+function ballsCount() { return turn; }
+
+function shoot(ang) {
+  hint = null;
+  volley = new Volley(grid, launcherX, ballsCount(), ang, onHit);
+  state = 'fly'; flyTime = 0; acc = 0;
+}
+function onHit(r, c, killed) {
+  const key = r * COLS + c;
+  flashes[key] = 1;
+  if (killed) {
+    score++;
+    const col = brickColor(1 + Math.floor(Math.random() * 3) + turn);
+    const cx = GX + c * PX + BW / 2, cy = GY + r * PY + BH / 2;
+    for (let i = 0; i < 10; i++) {
+      const a = Math.random() * Math.PI * 2, s = 1 + Math.random() * 3;
+      parts.push({ x: cx, y: cy, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 1, col: lastColor[key] || col });
+    }
+  }
+}
+const lastColor = {};
+
+function endTurn() {
+  launcherX = volley.firstX ?? launcherX;
+  volley = null;
+  turn++;
+  grid.pop();
+  grid.unshift(newRow(turn));
+  shiftT = 0;
+  state = 'shift';
+}
+function afterShift() {
+  if (grid[ROWS - 1].some(v => v > 0)) {
+    state = 'over';
+    if (score > best) { best = score; try { localStorage.setItem('brick_best', best); } catch (e) {} }
+    document.getElementById('ovScore').textContent = score;
+    document.getElementById('ovRec').textContent = 'Record ' + best;
+    setTimeout(() => { over.style.display = 'flex'; }, 350);
+  } else state = 'aim';
+}
+
+// ---------- Colours ----------
+const STOPS = [[1,[209,42,101]],[2,[217,78,52]],[3,[201,113,26]],[4,[145,110,7]],[5,[110,128,36]],
+  [6,[46,128,78]],[8,[26,122,104]],[11,[20,115,144]],[15,[21,115,172]],[22,[36,105,177]],
+  [30,[56,96,182]],[45,[78,82,190]],[80,[104,70,196]]];
+function brickColor(v) {
+  if (v <= 1) return 'rgb(209,42,101)';
+  for (let i = 1; i < STOPS.length; i++) {
+    if (v <= STOPS[i][0]) {
+      const [v0, a] = STOPS[i - 1], [v1, b] = STOPS[i], t = (v - v0) / (v1 - v0);
+      return `rgb(${a.map((x, k) => Math.round(x + (b[k] - x) * t)).join(',')})`;
+    }
+  }
+  return 'rgb(104,70,196)';
+}
+
+// ---------- Input ----------
+function toLocal(e) {
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width * (W + 2 * MX) - MX, y: (e.clientY - r.top) / r.height * H };
+}
+function angleFrom(p) {
+  const dx = p.x - launcherX, dy = FLOOR_Y - p.y;
+  let a = Math.atan2(Math.max(dy, 0.0001), dx);
+  return Math.min(Math.PI - MIN_ANG, Math.max(MIN_ANG, a));
+}
+cv.addEventListener('pointerdown', e => {
+  if (state !== 'aim' || solving) return;
+  cv.setPointerCapture(e.pointerId);
+  const p = toLocal(e); aim = { a: angleFrom(p), p };
+});
+cv.addEventListener('pointermove', e => {
+  if (!aim) return; const p = toLocal(e); aim = { a: angleFrom(p), p };
+});
+cv.addEventListener('pointerup', e => {
+  if (!aim) return; const p = toLocal(e), a = angleFrom(p); aim = null;
+  if (state === 'aim' && p.y < FLOOR_Y + 25) shoot(a);
+});
+cv.addEventListener('pointercancel', () => { aim = null; });
+document.getElementById('again').onclick = reset;
+// Worker pool (one per core) for the solver; falls back to running inline.
+let pool;
+function getPool() {
+  if (pool !== undefined) return pool;
+  try {
+    const src = document.getElementById('engine').textContent;
+    const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+    const k = Math.max(2, Math.min(8, navigator.hardwareConcurrency || 4));
+    pool = Array.from({ length: k }, () => new Worker(url));
+  } catch (e) { pool = null; }
+  return pool;
+}
+function runPool(jobs, prog) {
+  return new Promise((resolve, reject) => {
+    const out = new Array(jobs.length); let next = 0, done = 0;
+    if (!jobs.length) return resolve(out);
+    const feed = w => {
+      if (next >= jobs.length) return;
+      const id = next++;
+      w.onmessage = e => { out[id] = e.data; done++; prog(done / jobs.length);
+        if (done === jobs.length) resolve(out); else feed(w); };
+      w.onerror = err => reject(err);
+      w.postMessage(jobs[id]);
+    };
+    pool.forEach(feed);
+  });
+}
+hintBtn.onclick = async () => {
+  if (state !== 'aim' || solving) return;
+  solving = true; hintBtn.disabled = true;
+  const snap = grid.map(r => r.slice()), t = turn;
+  const prog = p => { hintBtn.textContent = 'Calcolo… ' + Math.round(p * 100) + '%'; };
+  let b;
+  try { b = await solve(snap, launcherX, ballsCount(), t, prog, getPool() ? runPool : runInline); }
+  catch (e) { pool = null; b = await solve(snap, launcherX, ballsCount(), t, prog, runInline); }
+  solving = false; hintBtn.disabled = false; hintBtn.textContent = '💡 Suggerisci';
+  if (state === 'aim' && turn === t) hint = b;
+};
+
+// ---------- Rendering ----------
+function rr(x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function drawLauncher(x, n) {
+  ctx.fillStyle = 'rgba(255,255,255,0.10)';
+  ctx.beginPath(); ctx.arc(x, FLOOR_Y, 27, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(x, FLOOR_Y, 18, 0, Math.PI * 2); ctx.fill();
+  if (n > 1) {
+    ctx.fillStyle = '#0c2768'; ctx.font = '800 14px Montserrat, Arial, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(n, x, FLOOR_Y + 1);
+  }
+}
+function drawDots(a, len, color, rad, minA = 0.15) {
+  const dx = Math.cos(a), dy = -Math.sin(a);
+  for (let i = 0, d = 30; d < len; i++, d += 14) {
+    ctx.globalAlpha = Math.max(minA, 1 - d / (len * 1.1));
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(launcherX + dx * d, FLOOR_Y + dy * d, rad, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function draw() {
+  ctx.save(); ctx.translate(MX, 0);
+  ctx.fillStyle = '#0c2768'; ctx.fillRect(-MX, 0, W + 2 * MX, H);
+  // side walls: thin lines, as in the real game (the balls bounce on them)
+  ctx.fillStyle = 'rgb(78,101,144)';
+  ctx.fillRect(-1, TOP - 103, 1, H); ctx.fillRect(W, TOP - 103, 1, H);
+
+  // record pill
+  ctx.font = '800 13px Montserrat, Arial, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const rec = 'RECORD ' + Math.max(best, score), tw = ctx.measureText(rec).width + 26;
+  ctx.fillStyle = 'rgba(255,255,255,0.14)'; rr(W / 2 - tw / 2, 26, tw, 26, 13); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.fillText(rec, W / 2, 40);
+
+  // score + top line
+  ctx.font = '900 58px Montserrat, Arial, sans-serif'; ctx.fillText(score, W / 2, TOP - 52);
+  ctx.fillStyle = '#fff'; rr(16, TOP - 2, W - 32, 4, 2); ctx.fill();
+
+  // bricks
+  const off = (1 - easeOut(shiftT)) * PY;
+  let danger = false;
+  ctx.save(); ctx.beginPath(); ctx.rect(0, TOP + 2, W, H); ctx.clip();
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    const v = grid[r][c]; if (v <= 0) continue;
+    if (r >= ROWS - 2) danger = true;
+    const key = r * COLS + c, fl = flashes[key] || 0;
+    const x = GX + c * PX, y = GY + r * PY - off;
+    const col = brickColor(v); lastColor[key] = col;
+    const s = 1 + fl * 0.05;
+    ctx.save(); ctx.translate(x + BW / 2, y + BH / 2); ctx.scale(s, s);
+    if (r === 0 && shiftT < 1) ctx.globalAlpha = easeOut(shiftT);
+    ctx.fillStyle = 'rgba(0,0,0,0.22)'; rr(-BW / 2, -BH / 2 + 3, BW, BH, 9); ctx.fill();
+    ctx.fillStyle = col; rr(-BW / 2, -BH / 2, BW, BH, 9); ctx.fill();
+    if (fl > 0) { ctx.fillStyle = `rgba(255,255,255,${fl * 0.35})`; rr(-BW / 2, -BH / 2, BW, BH, 9); ctx.fill(); }
+    ctx.fillStyle = '#fff'; ctx.font = '800 22px Montserrat, Arial, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(v, 0, 1);
+    ctx.restore();
+  }
+  ctx.restore();
+
+  // particles
+  for (const p of parts) {
+    ctx.globalAlpha = Math.max(0, p.life); ctx.fillStyle = p.col;
+    ctx.fillRect(p.x - 3, p.y - 3, 6, 6);
+  }
+  ctx.globalAlpha = 1;
+
+  // danger line
+  if (danger || state === 'over') {
+    ctx.strokeStyle = '#d8467f'; ctx.lineWidth = 2; ctx.setLineDash([8, 7]);
+    ctx.beginPath(); ctx.moveTo(26, DANGER_Y); ctx.lineTo(W - 26, DANGER_Y); ctx.stroke(); ctx.setLineDash([]);
+  }
+
+  // hint
+  if (hint && state === 'aim') {
+    drawDots(hint.a, 260, '#ffd34d', 4, 0.75);
+    const d = 280, hx = launcherX + Math.cos(hint.a) * d, hy = FLOOR_Y - Math.sin(hint.a) * d;
+    ctx.font = '800 14px Montserrat, Arial, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    const lbl = hint.dead ? 'Nessun tiro salva la partita'
+      : `${(hint.a * 180 / Math.PI).toFixed(1)}° · +${hint.d} ora` + (hint.surv2 < 1 ? ' · ⚠ rischio' : ` · ~${Math.round(hint.d2)} dopo`);
+    const lw = ctx.measureText(lbl).width + 16;
+    const lx = Math.min(W - lw / 2 - 4, Math.max(lw / 2 + 4, hx));
+    ctx.fillStyle = '#ffd34d'; rr(lx - lw / 2, hy - 13, lw, 26, 13); ctx.fill();
+    ctx.fillStyle = '#0c2768'; ctx.fillText(lbl, lx, hy + 1);
+  }
+
+  // aim
+  if (aim && state === 'aim') drawDots(aim.a, 170, '#fff', 4);
+
+  // balls + launcher
+  if (state === 'fly' && volley) {
+    const lx = volley.firstX ?? volley.x0;
+    drawLauncher(lx, volley.n);
+    ctx.fillStyle = '#fff';
+    for (const b of volley.balls) {
+      if (b.on) { ctx.beginPath(); ctx.arc(b.x, b.y, R, 0, Math.PI * 2); ctx.fill(); }
+      else if (Math.abs(b.sx - lx) > 2) { ctx.beginPath(); ctx.arc(b.sx, FLOOR_Y, R, 0, Math.PI * 2); ctx.fill(); }
+    }
+  } else {
+    drawLauncher(launcherX, ballsCount());
+  }
+  ctx.restore();
+}
+const easeOut = t => 1 - Math.pow(1 - Math.min(1, t), 3);
+
+// ---------- Main loop ----------
+function frame(ts) {
+  const dt = Math.min(50, ts - (lastTs || ts)); lastTs = ts;
+  if (state === 'fly') {
+    flyTime += dt;
+    const speedUp = flyTime > 20000 ? 5 : flyTime > 10000 ? 3 : flyTime > 4500 ? 2 : 1;
+    acc += dt / (1000 / 60) * speedUp;
+    let n = 0;
+    while (acc >= 1 && !volley.done && n++ < 40) { volley.tick(); acc -= 1; }
+    // slide landed balls towards the new launcher
+    if (volley.firstX !== null) for (const b of volley.balls) if (!b.on) b.sx += Math.sign(volley.firstX - b.sx) * Math.min(14, Math.abs(volley.firstX - b.sx));
+    if (volley.done && volley.balls.every(b => Math.abs(b.sx - volley.firstX) < 2)) endTurn();
+  } else if (state === 'shift') {
+    shiftT += dt / 200; if (shiftT >= 1) { shiftT = 1; afterShift(); }
+  }
+  for (const k in flashes) { flashes[k] -= dt / 140; if (flashes[k] <= 0) delete flashes[k]; }
+  for (const p of parts) { p.x += p.vx; p.y += p.vy; p.vy += 0.08; p.life -= dt / 450; }
+  parts = parts.filter(p => p.life > 0);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+function fit() {
+  const WW = W + 2 * MX, s = Math.min(innerWidth / WW, innerHeight / H), dpr = window.devicePixelRatio || 1;
+  cv.style.width = WW * s + 'px'; cv.style.height = H * s + 'px';
+  cv.width = Math.round(WW * s * dpr); cv.height = Math.round(H * s * dpr);
+  ctx.setTransform(s * dpr, 0, 0, s * dpr, 0, 0);
+}
+addEventListener('resize', fit);
+fit(); reset(); requestAnimationFrame(frame);
+</script>
+</body>
+</html>
